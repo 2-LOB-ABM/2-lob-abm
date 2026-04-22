@@ -22,14 +22,14 @@ class OptionDealer(Agent):
         model,
         pricing_model: PricingModel,
         contract_ids,
-        r=0.0,
+        r=0.0,                      # risk-free rate
         base_spread_pct=0.02,
         quote_size=10,
-        hedge_frequency=1,  # Hedge every N steps (1 = every step)
+        hedge_frequency=1,          # Hedge every N steps (1 = every step)
         inventory_risk_aversion=0.1,
         enable_model_switching=True,
-        switching_window=50,  # Steps to evaluate performance
-        switching_threshold=0.05,  # Minimum improvement to switch
+        switching_window=50,        # Steps to evaluate performance
+        switching_threshold=0.05,   # Minimum improvement to switch
         **pricer_kwargs
     ):
         super().__init__(model)
@@ -44,52 +44,83 @@ class OptionDealer(Agent):
         self.switching_window = int(switching_window)
         self.switching_threshold = float(switching_threshold)
         
-        # Initialize pricer
+
         self.pricer = get_pricer(pricing_model, **pricer_kwargs)
         
         # Inventory tracking: contract_id -> (position, avg_price)
         self.inventory = defaultdict(lambda: {"position": 0, "avg_price": 0.0})
         
         # Hedging: delta position in underlying
-        self.hedge_position = 0.0  # Net delta hedge position
+        self.hedge_position = 0.0  
         
         # Performance tracking for model switching
-        self.hedge_errors = []  # List of (step, error) tuples
-        self.pnl_history = []  # Cumulative PnL history
-        self.total_pnl = 0.0  # Total PnL
+        self.hedge_errors = []          # (step, error) 
+        self.pnl_history = [] 
+        self.total_pnl = 0.0  
         self.last_hedge_step = 0
-        self.last_hedge_price = None  # Price when last hedge was executed
-        self.last_option_value = 0.0  # Last calculated option portfolio value
-        self.last_delta = 0.0  # Last delta position
+        self.last_hedge_price = None    # Price when last hedge was executed
+        self.last_option_value = 0.0    # Last calculated option portfolio value
+        self.last_delta = 0.0 
         
         # Track when we get new option positions (trades executed against our quotes)
-        self.trades_received = []  # List of (step, contract_id, side, qty, price)
+        self.trades_received = []  
         
-        # Inertia: prevent switching back too quickly
         self.last_switch_step = -1000  # Step when we last switched models
-        self.switch_cooldown = 20  # Minimum steps between switches
+        self.switch_cooldown = 20      # Minimum steps between switches
         
         # Track error trend for trend-based switching
-        self.error_trend = []  # List of recent errors to detect trends
-        self.trend_window = 5  # Number of steps to check for increasing trend
+        self.error_trend = [] 
+        self.trend_window = 5          # Number of steps to check for increasing trend
         
-        # Live quotes tracking
-        self.live_quotes = defaultdict(list)  # contract_id -> [order_ids]
+        # Performance optimization: calculate all-model errors less frequently
+        self._last_all_models_error_calc = -10
+        self._all_models_error_frequency = 5  # Calculate every N steps
         
-        # Model switching candidates
+        self.live_quotes = defaultdict(list)  
+        
         self.available_models = [PricingModel.BS, PricingModel.TFBS, PricingModel.HESTON]
-        # Track hedging errors for ALL models (not just current one)
-        # This allows us to compare models and choose the best one
+        
+        # Replicator switching ======================================================
+        n_strategies = len(self.available_models)
+        self.strategy_weights = {m: 1.0 / n_strategies for m in self.available_models}
+        self.strategy_quality = {m: 0.0 for m in self.available_models}
+         
+        self.alpha = 0.05          # smoothing parameter for Q_s (reduced from 0.1 for slower forgetting)
+        self.eta = 1.5             # replicator dynamics parameter (increased from 0.5 for faster adaptation)
+        self.epsilon_floor = 0.01  # minimum weight floor to allow strategies to return
+        
+        self.switch_cost = 0.01  
+        self.min_hold_time = 1  # Reduced from 5 to allow more frequent switching
+        self.last_strategy_switch_step = -1000  
+        self.current_strategy = pricing_model  
+        
+        # Track hedging errors for ALL models ========================================
         self.model_hedge_errors = {m: [] for m in self.available_models}
-        # Store pricers for all models to evaluate them in parallel
         self.model_pricers = {}
+        # Store last delta and option value for each model to calculate real hedging errors
+        self.model_last_delta = {m: 0.0 for m in self.available_models}
+        self.model_last_option_value = {m: 0.0 for m in self.available_models}
         for model_type in self.available_models:
             if model_type == PricingModel.TFBS:
-                self.model_pricers[model_type] = get_pricer(model_type, alpha=0.85, n_mc=5000)
+                self.model_pricers[model_type] = get_pricer(model_type, alpha=0.85, n_mc=1000)
             elif model_type == PricingModel.HESTON:
-                self.model_pricers[model_type] = get_pricer(model_type, kappa=2.0, theta=0.04, sigma_v=0.3, rho=-0.7, n_mc=5000)
+                self.model_pricers[model_type] = get_pricer(model_type, kappa=2.0, theta=0.04, sigma_v=0.3, rho=-0.7, n_mc=1000)
             else:
                 self.model_pricers[model_type] = get_pricer(model_type)
+        
+        self.wealth = 0.0       # total wealth (options + hedge + cash)
+        self.last_wealth = None  # previous step wealth (None = not initialized yet)
+        self.cash = 0.0         # cash position
+        self._first_reward_calc = True  # Flag for first reward calculation
+        
+        # Reward function parameters
+        self.lambda_risk = 0.1      # Risk penalty coefficient
+        self.kappa_gamma = 0.001    # Gamma risk penalty coefficient (reduced from 0.01)
+        self.kappa_vega = 0.001     # Vega risk penalty coefficient (reduced from 0.01)
+        self.kappa_inventory = 0.001  # Inventory penalty coefficient
+        
+        # Track reward for logging
+        self.current_reward = 0.0
         
     def _get_reservation_price(self, contract_id, option_type, strike, maturity):
         """Calculate reservation price based on current model."""
@@ -116,9 +147,10 @@ class OptionDealer(Agent):
         else:
             raise ValueError(f"Unknown pricing model: {self.pricing_model}")
         
-        # Adjust for inventory risk
+        # adjust for inventory risk
         inv = self.inventory[contract_id]["position"]
         inventory_adjustment = self.inventory_risk_aversion * inv * price * 0.01
+
         return float(price - inventory_adjustment)
     
     def _get_greeks(self, contract_id, option_type, strike, maturity):
@@ -162,9 +194,9 @@ class OptionDealer(Agent):
     
     def _calculate_model_error(self, model_type, price_change):
         """
-        Calculate theoretical hedging error for a given model.
-        Compares how well this model would have hedged our actual positions.
-        Uses the same positions for all models to ensure fair comparison.
+        Calculate REAL hedging error for this model using actual positions.
+        This computes what the error would have been if we had used this model's delta.
+        Now includes gamma risk to make errors more distinct between models.
         """
         if model_type not in self.model_pricers:
             return 0.0
@@ -172,13 +204,20 @@ class OptionDealer(Agent):
         if abs(price_change) < 1e-6:
             return 0.0
         
+        # If we have no inventory, return small baseline error
+        total_inventory = sum(abs(inv_data["position"]) for inv_data in self.inventory.values())
+        if total_inventory < 0.01:
+            return 0.0
+        
         S = float(self.model.current_price)
         sigma = float(max(self.model.volatility, 1e-6))
         pricer = self.model_pricers[model_type]
-        total_error = 0.0
         
-        # Calculate error for each contract in our ACTUAL inventory
-        # This ensures we compare models fairly using the same positions
+        # Calculate current option portfolio value using THIS model
+        current_option_value = 0.0
+        current_total_delta = 0.0
+        current_total_gamma = 0.0
+        
         for contract_id, inv_data in self.inventory.items():
             contract = self.model.options_market.get_contract(contract_id)
             if contract is None:
@@ -188,110 +227,74 @@ class OptionDealer(Agent):
             if abs(position) < 0.01:
                 continue
             
-            # Calculate current delta for this model
+            # Calculate option price, delta, and gamma using this model
             if model_type == PricingModel.BS:
                 if contract.option_type == "call":
-                    delta_now = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity)
-                else:
-                    delta_now = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity)
-            elif model_type == PricingModel.TFBS:
-                seed = self.model.rng.integers(0, 2**31)
-                if contract.option_type == "call":
-                    delta_now = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                else:
-                    delta_now = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-            elif model_type == PricingModel.HESTON:
-                seed = self.model.rng.integers(0, 2**31)
-                if contract.option_type == "call":
-                    delta_now = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                else:
-                    delta_now = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-            else:
-                delta_now = 0.0
-            
-            # Calculate what delta was at last hedge (approximate using current delta)
-            # The error is based on how much delta changed vs price change
-            # If we had hedged with this model's delta, what would be the error?
-            # Error = |actual_option_pnl - hedge_pnl|
-            # We approximate option_pnl using delta approximation: position * delta * price_change
-            # But we need to compare with what the hedge would have been
-            
-            # If we had used this model's delta at last hedge, hedge PnL would be:
-            # (position * delta_at_last_hedge * price_change)
-            # But we don't know delta_at_last_hedge, so we approximate:
-            # The error is the difference between how much delta changed
-            # For a fair comparison, we use the fact that better models have more stable deltas
-            # Error scales with gamma (rate of change of delta)
-            
-            # Calculate gamma to estimate delta change
-            if model_type == PricingModel.BS:
-                if contract.option_type == "call":
+                    option_price = pricer.price_call(S, contract.strike, self.r, sigma, contract.maturity)
+                    delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity)
                     gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity)
                 else:
+                    option_price = pricer.price_put(S, contract.strike, self.r, sigma, contract.maturity)
+                    delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity)
                     gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity)
             elif model_type == PricingModel.TFBS:
                 seed = self.model.rng.integers(0, 2**31)
                 if contract.option_type == "call":
+                    option_price = pricer.price_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                    delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
                     gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
                 else:
+                    option_price = pricer.price_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                    delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
                     gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
             elif model_type == PricingModel.HESTON:
                 seed = self.model.rng.integers(0, 2**31)
                 if contract.option_type == "call":
+                    option_price = pricer.price_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                    delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
                     gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
                 else:
+                    option_price = pricer.price_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                    delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
                     gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
             else:
+                option_price = 0.0
+                delta = 0.0
                 gamma = 0.0
             
-            # Error is proportional to gamma * price_change^2 (delta changes with price)
-            # Models with higher gamma have larger hedging errors when price moves
-            delta_change_error = abs(position * gamma * price_change * price_change) * 0.5
-            total_error += delta_change_error
+            current_option_value += position * option_price
+            current_total_delta += position * delta
+            current_total_gamma += position * gamma
         
-        # If no inventory, calculate theoretical error based on potential positions
-        if total_error == 0.0:
-            for contract_id in self.contract_ids:
-                contract = self.model.options_market.get_contract(contract_id)
-                if contract is None:
-                    continue
-                
-                # Calculate theoretical delta and gamma
-                if model_type == PricingModel.BS:
-                    if contract.option_type == "call":
-                        delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity)
-                        gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity)
-                    else:
-                        delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity)
-                        gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity)
-                elif model_type == PricingModel.TFBS:
-                    seed = self.model.rng.integers(0, 2**31)
-                    if contract.option_type == "call":
-                        delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                        gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                    else:
-                        delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                        gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                elif model_type == PricingModel.HESTON:
-                    seed = self.model.rng.integers(0, 2**31)
-                    if contract.option_type == "call":
-                        delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                        gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                    else:
-                        delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                        gamma = pricer.gamma(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
-                else:
-                    delta = 0.0
-                    gamma = 0.0
-                
-                # Theoretical error scales with gamma (delta sensitivity) and price change
-                theoretical_position = 10.0  # Assume 10 contracts
-                theoretical_error = abs(theoretical_position * gamma * price_change * price_change) * 0.5
-                if abs(price_change) > 0.001:
-                    theoretical_error += 0.001
-                total_error += theoretical_error
+        # Calculate what the hedge PnL would have been with this model's delta
+        # We use the last delta we stored for this model (from previous hedge)
+        last_delta_for_model = self.model_last_delta[model_type]
+        hedge_pnl_if_used_this_model = last_delta_for_model * price_change
         
-        return total_error
+        # Calculate option PnL using this model's pricing
+        last_option_value_for_model = self.model_last_option_value[model_type]
+        option_pnl = current_option_value - last_option_value_for_model
+        
+        # Real hedging error = |option_pnl - hedge_pnl|
+        # This is what the error would have been if we had used this model
+        real_error = abs(option_pnl - hedge_pnl_if_used_this_model)
+        
+        # Add gamma risk component to make errors more distinct between models
+        # Gamma risk = 0.5 * gamma * price_change^2 (second-order effect)
+        gamma_risk = 0.5 * abs(current_total_gamma) * (price_change ** 2)
+        total_error = real_error + gamma_risk
+        
+        # Normalize by price change to make errors comparable
+        if abs(price_change) > 1e-6:
+            normalized_error = total_error / abs(price_change)
+        else:
+            normalized_error = total_error
+        
+        # Update stored values for next iteration
+        self.model_last_delta[model_type] = current_total_delta
+        self.model_last_option_value[model_type] = current_option_value
+        
+        return normalized_error
     
     def _check_option_trades(self):
         """Check if any of our option quotes were executed by monitoring LOB trades."""
@@ -300,8 +303,9 @@ class OptionDealer(Agent):
         
         current_step = self.model.market.book.t
         
-        # Track previous inventory state
-        prev_inventory = dict(self.inventory)
+        # Track which trades we've already processed to avoid double-counting
+        if not hasattr(self, '_processed_trades'):
+            self._processed_trades = set()
         
         # Check each contract's LOB for trades involving our orders
         for contract_id in self.contract_ids:
@@ -309,12 +313,18 @@ class OptionDealer(Agent):
             if lob is None:
                 continue
             
-            # Check recent trades in this contract's LOB
+            # Check ALL trades in this contract's LOB (not just recent ones)
+            # Use trade tuple as unique identifier to avoid double processing
             for trade in lob.trades:
                 step, price, qty, passive_id, aggressive_id = trade
+                trade_key = (contract_id, step, price, qty, passive_id, aggressive_id)
                 
-                # If we were the passive side (our quote was hit) and this is a recent trade
-                if passive_id == self.unique_id and step >= current_step - 1:
+                # Skip if we already processed this trade
+                if trade_key in self._processed_trades:
+                    continue
+                
+                # If we were the passive side (our quote was hit)
+                if passive_id == self.unique_id:
                     # Determine side: if our ask was hit, we sold; if our bid was hit, we bought
                     # Check our live quotes to see which side was hit
                     side = None
@@ -322,17 +332,42 @@ class OptionDealer(Agent):
                         order = lob.orders.get(oid)
                         if order is None:
                             continue
-                        # Check if this order was at the trade price
+                        # Check if this order was at the trade price (with tolerance)
                         order_price = order.price_ticks * lob.tick_size if order.price_ticks else None
-                        if order_price and abs(order_price - price) < 0.001:
+                        if order_price and abs(order_price - price) < 0.01:  # Increased tolerance
                             # If order was on ask side (sell), we sold; if bid side (buy), we bought
                             side = order.side
                             break
+                    
+                    # If we couldn't determine side from live quotes, infer from trade
+                    # If we were passive, we provided liquidity - check if trade was at bid or ask
+                    if side is None:
+                        # Try to infer from best bid/ask at time of trade
+                        # If price is closer to bid, we likely sold (ask was hit)
+                        # If price is closer to ask, we likely bought (bid was hit)
+                        best_bid = lob.best_bid()
+                        best_ask = lob.best_ask()
+                        if best_bid is not None and best_ask is not None:
+                            mid = (best_bid + best_ask) / 2
+                            if price >= mid:
+                                side = "sell"  # Our ask was hit
+                            else:
+                                side = "buy"   # Our bid was hit
                     
                     if side:
                         # Record the trade
                         self._record_trade(contract_id, side, qty, price)
                         self.trades_received.append((step, contract_id, side, qty, price))
+                        self._processed_trades.add(trade_key)
+                
+                # Also check if we were the aggressive side (we hit someone's quote)
+                elif aggressive_id == self.unique_id:
+                    # If we were aggressive, we hit someone's quote
+                    # This is less common for market makers, but we should track it
+                    # Determine side: if we bought, we hit an ask; if we sold, we hit a bid
+                    # For now, we'll infer from our intent (but this should be tracked separately)
+                    # Skip aggressive trades for now as dealers are primarily passive
+                    pass
     
     def _hedge_position(self):
         """Execute delta hedge in underlying market."""
@@ -372,19 +407,85 @@ class OptionDealer(Agent):
         delta_to_hedge = total_delta - self.hedge_position
         current_price = float(self.model.current_price)
         
+        # Initialize model tracking values on first hedge
+        if self.last_hedge_price is None:
+            # First hedge - initialize all model tracking
+            for model_type in self.available_models:
+                # Calculate initial option value and delta for each model
+                S = float(self.model.current_price)
+                sigma = float(max(self.model.volatility, 1e-6))
+                pricer = self.model_pricers[model_type]
+                
+                model_option_value = 0.0
+                model_delta = 0.0
+                
+                for contract_id, inv_data in self.inventory.items():
+                    contract = self.model.options_market.get_contract(contract_id)
+                    if contract is None:
+                        continue
+                    
+                    position = inv_data["position"]
+                    if abs(position) < 0.01:
+                        continue
+                    
+                    if model_type == PricingModel.BS:
+                        if contract.option_type == "call":
+                            option_price = pricer.price_call(S, contract.strike, self.r, sigma, contract.maturity)
+                            delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity)
+                        else:
+                            option_price = pricer.price_put(S, contract.strike, self.r, sigma, contract.maturity)
+                            delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity)
+                    elif model_type == PricingModel.TFBS:
+                        seed = self.model.rng.integers(0, 2**31)
+                        if contract.option_type == "call":
+                            option_price = pricer.price_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                            delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                        else:
+                            option_price = pricer.price_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                            delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                    elif model_type == PricingModel.HESTON:
+                        seed = self.model.rng.integers(0, 2**31)
+                        if contract.option_type == "call":
+                            option_price = pricer.price_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                            delta = pricer.delta_call(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                        else:
+                            option_price = pricer.price_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                            delta = pricer.delta_put(S, contract.strike, self.r, sigma, contract.maturity, seed=seed)
+                    else:
+                        option_price = 0.0
+                        delta = 0.0
+                    
+                    model_option_value += position * option_price
+                    model_delta += position * delta
+                
+                self.model_last_option_value[model_type] = model_option_value
+                self.model_last_delta[model_type] = model_delta
+        
         # Track hedging error for CURRENT model and ALL other models
         # This allows us to compare models and choose the best one
         if self.last_hedge_price is not None and self.last_hedge_step > 0:
             price_change = current_price - self.last_hedge_price
             
             # Calculate error for current model
-            if abs(self.last_option_value) > 0.01 or abs(current_option_value) > 0.01:
+            # Always calculate error, even if inventory is small, for better tracking
+            if abs(self.last_option_value) > 1e-6 or abs(current_option_value) > 1e-6 or abs(price_change) > 1e-6:
                 # We have inventory - track actual hedging error
                 hedge_pnl = self.hedge_position * price_change
                 option_pnl = current_option_value - self.last_option_value
                 hedge_error = option_pnl - hedge_pnl
+                
+                # Delta error: how much did delta change vs what we hedged?
+                # This captures gamma risk (delta changes with price)
                 delta_error = abs(total_delta - self.last_delta) * abs(price_change) * 0.1
-                total_error = abs(hedge_error) + delta_error
+                
+                # Total error is the absolute hedging error
+                # Normalize by price change to make it comparable across different price movements
+                if abs(price_change) > 1e-6:
+                    normalized_error = abs(hedge_error) / abs(price_change) if abs(price_change) > 1e-6 else abs(hedge_error)
+                else:
+                    normalized_error = abs(hedge_error)
+                
+                total_error = normalized_error + delta_error
                 
                 self.hedge_errors.append((self.model.market.book.t, total_error))
                 self.pnl_history.append(option_pnl - hedge_pnl)
@@ -394,32 +495,43 @@ class OptionDealer(Agent):
                 self.error_trend.append(total_error)
                 if len(self.error_trend) > self.trend_window:
                     self.error_trend.pop(0)  # Keep only recent errors
-            else:
-                # No inventory - calculate theoretical error
-                theoretical_error = self._calculate_model_error(self.pricing_model, price_change)
-                if theoretical_error > 0:
-                    self.hedge_errors.append((self.model.market.book.t, theoretical_error))
-                    if len(self.hedge_errors) > self.switching_window * 2:
-                        self.hedge_errors = self.hedge_errors[-self.switching_window:]
-                    self.error_trend.append(theoretical_error)
-                    if len(self.error_trend) > self.trend_window:
-                        self.error_trend.pop(0)
             
             # Calculate errors for ALL models to compare performance
-            for model_type in self.available_models:
-                model_error = self._calculate_model_error(model_type, price_change)
-                if model_error > 0:
-                    self.model_hedge_errors[model_type].append((self.model.market.book.t, model_error))
-                    # Keep error lists manageable
-                    if len(self.model_hedge_errors[model_type]) > self.switching_window * 2:
-                        self.model_hedge_errors[model_type] = self.model_hedge_errors[model_type][-self.switching_window:]
+            # Optimize: only calculate every N steps to reduce computation
+            current_step = self.model.market.book.t
+            steps_since_last_calc = current_step - self._last_all_models_error_calc
+            
+            if steps_since_last_calc >= self._all_models_error_frequency:
+                total_inventory = sum(abs(inv_data["position"]) for inv_data in self.inventory.values())
+                
+                for model_type in self.available_models:
+                    model_error = self._calculate_model_error(model_type, price_change)
+                    if abs(price_change) > 1e-6 or total_inventory > 0.01:
+                        self.model_hedge_errors[model_type].append((current_step, model_error))
+                        if len(self.model_hedge_errors[model_type]) > self.switching_window * 2:
+                            self.model_hedge_errors[model_type] = self.model_hedge_errors[model_type][-self.switching_window:]
+                
+                self._last_all_models_error_calc = current_step
         
         # Execute hedge
-        if abs(delta_to_hedge) > 0.01:  # Threshold to avoid micro-trades
+        # Use smaller threshold for more precise hedging, especially important for high gamma positions
+        hedge_threshold = 0.001  # Reduced from 0.01 for better hedging precision
+        if abs(delta_to_hedge) > hedge_threshold:
             # Execute hedge as market order
             qty = int(abs(delta_to_hedge))
             side = "buy" if delta_to_hedge > 0 else "sell"
+            
+            # Get execution price (approximate using current mid price)
+            # In reality, market orders execute at best bid/ask, but for simplicity use mid
+            execution_price = current_price
             self.model.market.place_market(self.unique_id, side, qty)
+            
+            # Update cash: buying costs money, selling receives money
+            if side == "buy":
+                self.cash -= qty * execution_price
+            else:  # sell
+                self.cash += qty * execution_price
+            
             self.hedge_position += delta_to_hedge
         
         # Update tracking
@@ -489,222 +601,298 @@ class OptionDealer(Agent):
                 new_avg = old_avg  # Keep same average
             
             self.inventory[contract_id] = {"position": new_position, "avg_price": new_avg}
+        
+        # Update cash: if we sold (side="sell"), we receive cash; if we bought, we pay cash
+        if side == "sell":
+            self.cash += qty * price
+        else:  # buy
+            self.cash -= qty * price
     
-    def _evaluate_model_performance(self):
+    def _select_strategy(self):
         """
-        Evaluate current model performance based on accumulated hedging errors.
-        Implements evolutionary switching: dealers with poor performance switch models.
+        Select strategy probabilistically based on weights (Вариант 1 из PDF).
+        Returns the selected PricingModel.
+        """
+        if not self.enable_model_switching:
+            return self.pricing_model
+        
+        # Check minimum hold time
+        current_step = self.model.market.book.t
+        steps_since_switch = current_step - self.last_strategy_switch_step
+        
+        if steps_since_switch < self.min_hold_time:
+            # Keep current strategy
+            return self.current_strategy
+        
+        # Select strategy based on weights (categorical distribution)
+        weights_list = [self.strategy_weights[m] for m in self.available_models]
+        selected_idx = self.model.rng.choice(len(self.available_models), p=weights_list)
+        selected_strategy = self.available_models[selected_idx]
+        
+        # Update switch step if strategy changed
+        if selected_strategy != self.current_strategy:
+            self.last_strategy_switch_step = current_step
+        
+        return selected_strategy
+    
+    def _calculate_reward(self):
+        """
+        Calculate reward for the current step.
+        r(t) = ΔP&L(t) - λ·Risk(t) - κ·InventoryPenalty(t)
+        
+        Returns reward value.
+        """
+        # Calculate current wealth (mark-to-market)
+        # Wealth = option portfolio value + hedge position value + cash
+        
+        # Option portfolio value
+        option_value = 0.0
+        total_gamma = 0.0
+        total_vega = 0.0
+        
+        for contract_id, inv_data in self.inventory.items():
+            contract = self.model.options_market.get_contract(contract_id)
+            if contract is None:
+                continue
+            
+            # Calculate option value using current strategy
+            res_price = self._get_reservation_price(
+                contract_id,
+                contract.option_type,
+                contract.strike,
+                contract.maturity
+            )
+            option_value += inv_data["position"] * res_price
+            
+            # Calculate Greeks for risk calculation
+            greeks = self._get_greeks(
+                contract_id,
+                contract.option_type,
+                contract.strike,
+                contract.maturity
+            )
+            total_gamma += abs(inv_data["position"] * greeks["gamma"])
+            total_vega += abs(inv_data["position"] * greeks["vega"])
+        
+        # Hedge position value (mark-to-market)
+        current_price = float(self.model.current_price)
+        hedge_value = self.hedge_position * current_price
+        
+        # Total wealth
+        self.wealth = option_value + hedge_value + self.cash
+        
+        # ΔP&L = change in wealth
+        # On first step, initialize last_wealth to current wealth to avoid artificial jump
+        if self.last_wealth is None or self._first_reward_calc:
+            self.last_wealth = self.wealth
+            self._first_reward_calc = False
+            delta_pnl = 0.0  # No P&L on first step
+        else:
+            delta_pnl = self.wealth - self.last_wealth
+        
+        # Smooth delta_pnl to reduce volatility (exponential moving average)
+        if not hasattr(self, '_smoothed_pnl'):
+            self._smoothed_pnl = delta_pnl
+        else:
+            # Use EMA with alpha=0.3 to smooth out short-term volatility
+            self._smoothed_pnl = 0.3 * delta_pnl + 0.7 * self._smoothed_pnl
+        
+        # Use smoothed PnL for reward calculation to make it more stable
+        smoothed_delta_pnl = self._smoothed_pnl
+        
+        # Risk penalty: gamma and vega exposure (using linear penalty instead of quadratic for more realistic values)
+        risk_penalty = self.kappa_gamma * total_gamma + self.kappa_vega * total_vega
+        
+        # Inventory penalty: squared inventory
+        total_inventory = sum(abs(inv_data["position"]) for inv_data in self.inventory.values())
+        inventory_penalty = self.kappa_inventory * (total_inventory ** 2)
+        
+        # Calculate reward using smoothed PnL
+        reward = smoothed_delta_pnl - self.lambda_risk * risk_penalty - inventory_penalty
+        
+        # Apply switching cost if strategy changed
+        if hasattr(self, '_strategy_switched_this_step') and self._strategy_switched_this_step:
+            reward -= self.switch_cost
+        
+        # Update last wealth for next step
+        self.last_wealth = self.wealth
+        
+        return reward
+    
+    def _update_strategy_quality(self, selected_strategy, reward):
+        """
+        Update quality score Q_s for the selected strategy using exponential smoothing.
+        Q_s(t+1) = (1-α) * Q_s(t) + α * r(t)
+        
+        Now also directly incorporates hedging errors into quality calculation
+        to make model selection more accurate.
         """
         if not self.enable_model_switching:
             return
         
-        # Check cooldown - don't switch too frequently
-        steps_since_switch = self.model.market.book.t - self.last_switch_step
-        if steps_since_switch < self.switch_cooldown:
+        # Calculate hedging error penalty for selected strategy
+        hedge_error_penalty = 0.0
+        if hasattr(self, 'model_hedge_errors') and len(self.model_hedge_errors.get(selected_strategy, [])) > 0:
+            recent_errors = [e[1] for e in self.model_hedge_errors.get(selected_strategy, [])[-10:]]
+            if recent_errors:
+                avg_error = np.mean(recent_errors)
+                # Penalize high hedging errors (scale: 1.0 error = -0.1 reward penalty)
+                hedge_error_penalty = -avg_error * 0.1
+        
+        # Adjusted reward = reward - hedging error penalty
+        adjusted_reward = reward + hedge_error_penalty
+        
+        # Update selected strategy with full weight
+        current_q = self.strategy_quality[selected_strategy]
+        new_q = (1.0 - self.alpha) * current_q + self.alpha * adjusted_reward
+        self.strategy_quality[selected_strategy] = new_q
+        
+        # Update other strategies with counterfactual reward estimation
+        # Use hedging errors to estimate what reward would have been with other strategies
+        off_policy_alpha = self.alpha * 0.2
+        
+        for strategy in self.available_models:
+            if strategy != selected_strategy:
+                current_q_other = self.strategy_quality[strategy]
+                
+                # Estimate counterfactual reward based on hedging errors
+                # If this strategy has lower hedging errors, it would have better reward
+                if hasattr(self, 'model_hedge_errors') and len(self.model_hedge_errors.get(strategy, [])) > 0:
+                    # Get recent errors for both strategies
+                    recent_errors_selected = [e[1] for e in self.model_hedge_errors.get(selected_strategy, [])[-10:]]
+                    recent_errors_other = [e[1] for e in self.model_hedge_errors.get(strategy, [])[-10:]]
+                    
+                    if recent_errors_selected and recent_errors_other:
+                        avg_error_selected = np.mean(recent_errors_selected)
+                        avg_error_other = np.mean(recent_errors_other)
+                        
+                        # Estimate reward difference based on error difference
+                        # Lower error -> higher reward (inverse relationship)
+                        error_diff = avg_error_selected - avg_error_other
+                        # Scale error difference to reward scale
+                        estimated_reward_diff = -error_diff * 0.1  # Same scale as penalty above
+                        counterfactual_reward = adjusted_reward + estimated_reward_diff
+                    else:
+                        counterfactual_reward = adjusted_reward * 0.5
+                else:
+                    # No error data - use conservative estimate
+                    counterfactual_reward = adjusted_reward * 0.5
+                
+                # Update quality with counterfactual reward
+                new_q_other = (1.0 - off_policy_alpha) * current_q_other + off_policy_alpha * counterfactual_reward
+                self.strategy_quality[strategy] = new_q_other
+    
+    def _update_strategy_weights(self):
+        """
+        Update strategy weights using replicator dynamics.
+        w_s(t+1) = w_s(t) * exp(η * Q_s(t+1)) / Σ_j w_j(t) * exp(η * Q_j(t+1))
+        
+        Also applies epsilon-floor to prevent weights from going to zero.
+        """
+        if not self.enable_model_switching:
             return
         
-        # Need some data to evaluate, but allow evaluation with less data too
-        min_errors_needed = max(5, self.switching_window // 10)  # Reduced: at least 5 errors or 10% of window
-        if len(self.hedge_errors) < min_errors_needed:
-            # Still allow regime-based switching even with few errors
-            pass
+        # Calculate new unnormalized weights
+        new_weights = {}
+        denominator = 0.0
+        
+        for strategy in self.available_models:
+            # Apply epsilon-floor
+            current_weight = max(self.strategy_weights[strategy], self.epsilon_floor)
+            quality = self.strategy_quality[strategy]
+            
+            # Replicator update
+            new_weight = current_weight * np.exp(self.eta * quality)
+            new_weights[strategy] = new_weight
+            denominator += new_weight
+        
+        # Normalize weights (ensure they sum to 1)
+        if denominator > 1e-10:
+            for strategy in self.available_models:
+                self.strategy_weights[strategy] = new_weights[strategy] / denominator
+                # Apply epsilon-floor again after normalization
+                self.strategy_weights[strategy] = max(self.strategy_weights[strategy], self.epsilon_floor)
         else:
-            # Use available errors (may be less than full window)
-            errors_to_use = min(len(self.hedge_errors), self.switching_window)
+            # Fallback: equal weights if denominator is too small
+            equal_weight = 1.0 / len(self.available_models)
+            for strategy in self.available_models:
+                self.strategy_weights[strategy] = equal_weight
         
-        # Calculate performance metrics using available errors
-        if len(self.hedge_errors) >= min_errors_needed:
-            recent_errors = [e[1] for e in self.hedge_errors[-errors_to_use:]]
-            mean_error = np.mean(recent_errors)
-            max_error = np.max(recent_errors) if recent_errors else 0.0
-            
-            # Also consider total PnL as a performance indicator
-            recent_pnl = self.pnl_history[-errors_to_use:] if len(self.pnl_history) >= errors_to_use else self.pnl_history
-            mean_pnl = np.mean(recent_pnl) if recent_pnl else 0.0
+        # Renormalize after applying floor
+        total_weight = sum(self.strategy_weights.values())
+        if total_weight > 1e-10:
+            for strategy in self.available_models:
+                self.strategy_weights[strategy] /= total_weight
+    
+    def _apply_strategy(self, strategy):
+        """
+        Apply the selected strategy by updating pricing_model and pricer.
+        """
+        if strategy == self.pricing_model:
+            return  # Already using this strategy
+        
+        old_model = self.pricing_model
+        self.pricing_model = strategy
+        
+        # Reinitialize pricer with appropriate parameters
+        if strategy == PricingModel.TFBS:
+            self.pricer = get_pricer(strategy, alpha=0.85, n_mc=1000)
+        elif strategy == PricingModel.HESTON:
+            self.pricer = get_pricer(strategy, kappa=2.0, theta=0.04, sigma_v=0.3, rho=-0.7, n_mc=1000)
         else:
-            # Not enough errors yet - use defaults
-            mean_error = 0.0
-            max_error = 0.0
-            mean_pnl = 0.0
+            self.pricer = get_pricer(strategy)
         
-        # Use absolute error values, not normalized (normalization can hide small but significant errors)
-        # Typical option price is around 1-10, so errors of 0.01-0.1 are significant
-        should_switch = False
-        switch_reason = None
-        
-        # Check for increasing error trend (errors increasing several steps in a row)
-        trend_increasing = False
-        trend_strength = 0.0
-        if len(self.error_trend) >= self.trend_window:
-            # Check if errors are consistently increasing
-            increasing_count = 0
-            for i in range(1, len(self.error_trend)):
-                if self.error_trend[i] > self.error_trend[i-1]:
-                    increasing_count += 1
-            
-            # If errors increased in most recent steps, it's a trend
-            if increasing_count >= self.trend_window - 1:  # All or almost all steps increasing
-                trend_increasing = True
-                # Calculate trend strength (relative increase)
-                if abs(self.error_trend[0]) > 1e-6:
-                    trend_strength = (self.error_trend[-1] - self.error_trend[0]) / abs(self.error_trend[0])
-                else:
-                    trend_strength = abs(self.error_trend[-1] - self.error_trend[0])
-        
-        # DETERMINISTIC switching based on error thresholds AND trends
-        # Lower thresholds to make switching more sensitive to errors
-        if mean_error > 0.03:  # Large error - definitely switch (lowered from 0.05)
-            should_switch = True
-            switch_reason = "large_error"
-        elif mean_error > 0.01:  # Medium error - high probability switch (lowered from 0.02)
-            switch_prob = 0.8  # 80% chance
-            should_switch = float(self.model.rng.uniform()) < switch_prob
-            switch_reason = "medium_error"
-        elif mean_error > 0.005 and mean_pnl < -0.005:  # Small error + negative PnL (lowered thresholds)
-            switch_prob = 0.6  # 60% chance (increased from 50%)
-            should_switch = float(self.model.rng.uniform()) < switch_prob
-            switch_reason = "error_and_loss"
-        elif trend_increasing:  # Errors increasing consistently over several steps
-            # Switch based on trend strength - more sensitive
-            if trend_strength > 0.3:  # Strong increasing trend (>30% increase, lowered from 50%)
-                should_switch = True
-                switch_reason = "strong_increasing_trend"
-            elif trend_strength > 0.15:  # Moderate increasing trend (>15% increase, lowered from 20%)
-                switch_prob = 0.8  # 80% chance (increased from 70%)
-                should_switch = float(self.model.rng.uniform()) < switch_prob
-                switch_reason = "moderate_increasing_trend"
-            elif trend_strength > 0.05:  # Weak but consistent increasing trend (>5% increase, lowered from 10%)
-                switch_prob = 0.5  # 50% chance (increased from 40%)
-                should_switch = float(self.model.rng.uniform()) < switch_prob
-                switch_reason = "weak_increasing_trend"
-        
-        # Choose model based ONLY on hedging errors - no regime influence
-        # Compare all models and choose the one with lowest average error
-        if should_switch:
-            other_models = [m for m in self.available_models if m != self.pricing_model]
-            
-            if not other_models:
-                return
-            
-            # Calculate average error for each model
-            model_avg_errors = {}
-            for model_type in self.available_models:
-                errors = self.model_hedge_errors[model_type]
-                if len(errors) >= min_errors_needed:
-                    recent_errors = [e[1] for e in errors[-self.switching_window:]]
-                    model_avg_errors[model_type] = np.mean(recent_errors)
-                else:
-                    # Not enough data - use a high default error
-                    model_avg_errors[model_type] = float('inf')
-            
-            # Choose model with lowest average error
-            # If multiple models have same error, prefer current model (inertia)
-            best_error = min(model_avg_errors.values())
-            best_models = [m for m, err in model_avg_errors.items() if err == best_error]
-            
-            # If current model is best, don't switch
-            if self.pricing_model in best_models and len(best_models) == 1:
-                return
-            
-            # Choose from best models (excluding current if it's not the only best)
-            candidate_models = [m for m in best_models if m != self.pricing_model]
-            if not candidate_models:
-                candidate_models = other_models
-            
-            # If we have error data, choose the best model
-            # Otherwise, choose randomly (shouldn't happen if should_switch is True)
-            if candidate_models:
-                new_model = candidate_models[0] if len(candidate_models) == 1 else self.model.rng.choice(candidate_models)
-            else:
-                new_model = self.model.rng.choice(other_models)
-            
-            if new_model != self.pricing_model:
-                # Switch model
-                old_model = self.pricing_model
-                self.pricing_model = new_model
-                self.last_switch_step = self.model.market.book.t  # Record switch time
-                
-                # Reinitialize pricer with appropriate parameters
-                if new_model == PricingModel.TFBS:
-                    self.pricer = get_pricer(new_model, alpha=0.85, n_mc=5000)
-                elif new_model == PricingModel.HESTON:
-                    self.pricer = get_pricer(new_model, kappa=2.0, theta=0.04, sigma_v=0.3, rho=-0.7, n_mc=5000)
-                else:
-                    self.pricer = get_pricer(new_model)
-                
-                # Reset performance tracking (keep some history for continuity)
-                # Keep last 25% of history
-                keep_size = max(5, self.switching_window // 4)
-                self.hedge_errors = self.hedge_errors[-keep_size:]
-                self.pnl_history = self.pnl_history[-keep_size:] if len(self.pnl_history) > keep_size else self.pnl_history
-                
-                # Reset error trend tracking
-                self.error_trend = []
-                
-                # Reset some tracking variables
-                self.last_hedge_price = None  # Will recalculate on next hedge
-                self.last_option_value = 0.0
-                
-                # Reset error tracking for new model (keep some history)
-                keep_size = max(5, self.switching_window // 4)
-                self.model_hedge_errors[new_model] = self.model_hedge_errors[new_model][-keep_size:]
-                
-                # Debug: print switch (optional, can be disabled)
-                if hasattr(self.model, 'debug') and self.model.debug:
-                    current_error = model_avg_errors.get(self.pricing_model, 0.0)
-                    new_error = model_avg_errors.get(new_model, 0.0)
-                    print(f"Dealer {self.unique_id}: {old_model.value} -> {new_model.value} "
-                          f"(reason: {switch_reason}, step: {self.model.market.book.t}, "
-                          f"current_error: {current_error:.4f}, new_error: {new_error:.4f})")
+        # Debug: print switch (optional, can be disabled)
+        if hasattr(self.model, 'debug') and self.model.debug:
+            print(f"Dealer {self.unique_id}: {old_model.value} -> {strategy.value} "
+                  f"(step: {self.model.market.book.t})")
     
     def step(self):
-        """Main step function for option dealer."""
-        # Check if we received any option trades (our quotes were hit)
+        """
+        Main step function for option dealer with replicator switching.
+        Implements the algorithm from PDF:
+        1. Select strategy probabilistically based on weights
+        2. Apply strategy (update pricing_model)
+        3. Quote and hedge using selected strategy
+        4. Calculate reward
+        5. Update Q_s for selected strategy
+        6. Update weights using replicator dynamics
+        """
+        # Step 1: Select strategy probabilistically 
+        if self.enable_model_switching:
+            selected_strategy = self._select_strategy()
+            strategy_switched = (selected_strategy != self.current_strategy)
+            self._apply_strategy(selected_strategy)
+            self.current_strategy = selected_strategy
+            self._strategy_switched_this_step = strategy_switched
+        else:
+            selected_strategy = self.pricing_model
+            self._strategy_switched_this_step = False
+        
+        # Step 2: Check if we received any option trades (our quotes were hit)
         self._check_option_trades()
         
-        # Update quotes
+        # Step 3: Update quotes using current strategy
         self._update_quotes()
         
-        # Hedge periodically (or every step if frequency is 1)
-        # Always hedge to accumulate errors for model evaluation
+        # Step 4: Hedge periodically (or every step if frequency is 1)
         if (self.model.market.book.t - self.last_hedge_step) >= self.hedge_frequency:
             self._hedge_position()
-        # Also track errors even when not hedging (for continuous evaluation)
-        elif self.last_hedge_price is not None:
-            # Update option values and track theoretical errors
-            current_price = float(self.model.current_price)
-            if abs(current_price - self.last_hedge_price) > 0.001:  # Price changed
-                # Quick error tracking without full hedge
-                current_option_value = 0.0
-                for contract_id, inv_data in self.inventory.items():
-                    contract = self.model.options_market.get_contract(contract_id)
-                    if contract is None:
-                        continue
-                    res_price = self._get_reservation_price(
-                        contract_id, contract.option_type, contract.strike, contract.maturity
-                    )
-                    current_option_value += inv_data["position"] * res_price
-                
-                if abs(current_option_value - self.last_option_value) > 0.001:
-                    price_change = current_price - self.last_hedge_price
-                    option_pnl = current_option_value - self.last_option_value
-                    hedge_pnl = self.hedge_position * price_change
-                    error = abs(option_pnl - hedge_pnl)
-                    if error > 0:
-                        self.hedge_errors.append((self.model.market.book.t, error))
-                        # Keep list manageable
-                        if len(self.hedge_errors) > self.switching_window * 2:
-                            self.hedge_errors = self.hedge_errors[-self.switching_window:]
-                        
-                        # Track error trend
-                        self.error_trend.append(error)
-                        if len(self.error_trend) > self.trend_window:
-                            self.error_trend.pop(0)
         
-        # Evaluate model performance and switch if needed (H1)
-        # Do this after hedging to accumulate errors
+        # Step 5: Calculate reward for this step
+        reward = self._calculate_reward()
+        self.current_reward = reward  # Store for logging
+        
+        # Step 6: Update quality Q_s for selected strategy (exponential smoothing)
         if self.enable_model_switching:
-            self._evaluate_model_performance()
+            self._update_strategy_quality(selected_strategy, reward)
+        
+        # Step 7: Update weights using replicator dynamics
+        if self.enable_model_switching:
+            self._update_strategy_weights()
+        
+        # Note: Don't reset _strategy_switched_this_step here - it's used for logging
+        # It will be set again at the start of next step
 
 
 class OptionTaker(Agent):

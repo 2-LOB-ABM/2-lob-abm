@@ -699,21 +699,26 @@ print(f"Regime log: {model.regime_log}")
 print(f"Model distribution: {model.dealer_model_distribution_log}")
 ```
 
-### Running Examples
+### Running Simulations
 
 ```bash
-# Run basic example
-python example_usage.py
+# Run simulation
+python run_simulation.py
+
+# Run with custom seed
+python run_simulation.py --seed 42
 ```
 
 This will:
-1. Run a basic simulation with options market
-2. Run a model switching demonstration
-3. Generate plots showing:
+1. Run a simulation with options market
+2. Generate plots showing:
    - Price path
    - Regime timeline
    - Model distribution over time
    - Hedging errors by model
+   - Rewards and strategy quality
+3. Save plots to `plots/` directory
+4. Save results to CSV logs in `simulation_logs/`
 
 ### Running Experiments
 
@@ -736,6 +741,19 @@ results_h1 = run_h1_experiment(cfg, n_replications=10)
 # H2: Heterogeneous vs homogeneous
 results_h2 = run_h2_experiment(cfg, n_replications=10)
 ```
+
+### Analyzing Results
+
+```bash
+# Analyze simulation results (statistical tests for H1)
+python analyze_results.py --market simulation_logs/market_log_*.csv --dealers simulation_logs/dealers_log_*.csv
+```
+
+This provides:
+- Performance metrics by model
+- Statistical tests for regime-model relationships
+- Switching behavior analysis
+- Hypothesis testing (H1)
 
 ### Running Dashboard
 

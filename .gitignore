@@ -149,4 +149,7 @@ logs/
 *.json
 !package.json
 !package-lock.json
+plots/
+*.png
+!README.md
 

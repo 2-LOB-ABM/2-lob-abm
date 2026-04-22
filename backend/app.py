@@ -6,6 +6,7 @@ import time
 import threading
 import sys
 import os
+import numpy as np
 
 # Add parent directory to path to import models
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -93,6 +94,45 @@ def get_step_data(model):
             'HESTON': float(model.dealer_hedge_errors_by_model.get(PricingModel.HESTON, [0.0])[-1]) if model.dealer_hedge_errors_by_model.get(PricingModel.HESTON) else 0.0,
         }
     
+    # Reward data per model - convert enum keys to strings for JSON serialization
+    reward_data = {}
+    if model.enable_options and hasattr(model, 'dealer_reward_log') and len(model.dealer_reward_log) > 0:
+        try:
+            latest_reward = model.dealer_reward_log[-1]
+            if isinstance(latest_reward, dict):
+                # Convert PricingModel enum keys to strings
+                reward_data = {
+                    'BS': float(latest_reward.get(PricingModel.BS, 0.0)),
+                    'TFBS': float(latest_reward.get(PricingModel.TFBS, 0.0)),
+                    'HESTON': float(latest_reward.get(PricingModel.HESTON, 0.0)),
+                }
+            else:
+                # Backward compatibility
+                reward_data = {
+                    'BS': float(latest_reward) if latest_reward else 0.0,
+                    'TFBS': float(latest_reward) if latest_reward else 0.0,
+                    'HESTON': float(latest_reward) if latest_reward else 0.0,
+                }
+        except (ValueError, TypeError, IndexError, AttributeError):
+            reward_data = {}
+    
+    # Strategy quality data - convert enum keys to strings for JSON serialization
+    strategy_quality = {}
+    if model.enable_options and hasattr(model, 'dealer_strategy_quality_log') and len(model.dealer_strategy_quality_log) > 0:
+        try:
+            quality = model.dealer_strategy_quality_log[-1]
+            if isinstance(quality, dict):
+                # Convert PricingModel enum keys to strings
+                strategy_quality = {
+                    'BS': float(quality.get(PricingModel.BS, 0.0)),
+                    'TFBS': float(quality.get(PricingModel.TFBS, 0.0)),
+                    'HESTON': float(quality.get(PricingModel.HESTON, 0.0)),
+                }
+            else:
+                strategy_quality = {}
+        except (ValueError, TypeError, IndexError, AttributeError):
+            strategy_quality = {}
+    
     # Send only current step data (incremental updates)
     # Client will accumulate the data
     current_step_idx = len(model.regime_log) - 1
@@ -129,6 +169,36 @@ def get_step_data(model):
         time_series['model_dist_BS'] = float(dist.get(PricingModel.BS, 0.0))
         time_series['model_dist_TFBS'] = float(dist.get(PricingModel.TFBS, 0.0))
         time_series['model_dist_HESTON'] = float(dist.get(PricingModel.HESTON, 0.0))
+    
+    # Reward current values per model
+    if model.enable_options and hasattr(model, 'dealer_reward_log') and len(model.dealer_reward_log) > 0:
+        latest_reward_dict = model.dealer_reward_log[-1]
+        if isinstance(latest_reward_dict, dict):
+            time_series['reward_BS'] = float(latest_reward_dict.get(PricingModel.BS, 0.0))
+            time_series['reward_TFBS'] = float(latest_reward_dict.get(PricingModel.TFBS, 0.0))
+            time_series['reward_HESTON'] = float(latest_reward_dict.get(PricingModel.HESTON, 0.0))
+        else:
+            # Backward compatibility: if it's a single value, use it for all
+            time_series['reward_BS'] = float(latest_reward_dict) if latest_reward_dict else 0.0
+            time_series['reward_TFBS'] = float(latest_reward_dict) if latest_reward_dict else 0.0
+            time_series['reward_HESTON'] = float(latest_reward_dict) if latest_reward_dict else 0.0
+    
+    # Strategy quality current values
+    if model.enable_options and hasattr(model, 'dealer_strategy_quality_log') and len(model.dealer_strategy_quality_log) > 0:
+        try:
+            quality = model.dealer_strategy_quality_log[-1]
+            if isinstance(quality, dict):
+                time_series['strategy_quality_BS'] = float(quality.get(PricingModel.BS, 0.0))
+                time_series['strategy_quality_TFBS'] = float(quality.get(PricingModel.TFBS, 0.0))
+                time_series['strategy_quality_HESTON'] = float(quality.get(PricingModel.HESTON, 0.0))
+            else:
+                time_series['strategy_quality_BS'] = 0.0
+                time_series['strategy_quality_TFBS'] = 0.0
+                time_series['strategy_quality_HESTON'] = 0.0
+        except (ValueError, TypeError, IndexError, AttributeError):
+            time_series['strategy_quality_BS'] = 0.0
+            time_series['strategy_quality_TFBS'] = 0.0
+            time_series['strategy_quality_HESTON'] = 0.0
     
     # Spot market trades - get recent trades (last 50 trades or from last 10 steps)
     spot_trades = []
@@ -174,6 +244,8 @@ def get_step_data(model):
         'options': options_data,
         'model_distribution': model_distribution,
         'hedge_errors': hedge_errors,
+        'reward': reward_data,
+        'strategy_quality': strategy_quality,
         'time_series': time_series,
         'hyperparameters': get_hyperparameters(model),
         'spot_trades': spot_trades,
@@ -277,6 +349,12 @@ def run_simulation():
                     socketio.emit('simulation_complete', {'message': f'Simulation completed: {step_count} steps executed, t={model.market.book.t}'})
                 except:
                     pass
+                # Close detailed logger to ensure all data is written to disk
+                if hasattr(model, 'detailed_logger') and model.detailed_logger:
+                    try:
+                        model.detailed_logger.close()
+                    except Exception as e:
+                        print(f"Error closing logger: {e}")
                 break
             
             
@@ -287,6 +365,12 @@ def run_simulation():
         except KeyboardInterrupt:
             print("Simulation interrupted by user")
             simulation_state['running'] = False
+            # Close logger on interrupt
+            if 'model' in locals() and hasattr(model, 'detailed_logger') and model.detailed_logger:
+                try:
+                    model.detailed_logger.close()
+                except:
+                    pass
             break
         except Exception as e:
             import traceback
@@ -297,6 +381,12 @@ def run_simulation():
             except:
                 pass
             simulation_state['running'] = False
+            # Close logger on error
+            if 'model' in locals() and hasattr(model, 'detailed_logger') and model.detailed_logger:
+                try:
+                    model.detailed_logger.close()
+                except:
+                    pass
             break
     
 

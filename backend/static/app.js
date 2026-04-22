@@ -85,11 +85,17 @@ let dataBuffers = {
     hedgeErrorBS: [],
     hedgeErrorTFBS: [],
     hedgeErrorHESTON: [],
+    rewardBS: [],
+    rewardTFBS: [],
+    rewardHESTON: [],
+    strategyQualityBS: [],
+    strategyQualityTFBS: [],
+    strategyQualityHESTON: [],
     optionSpreads: {},
     optionDepths: {},
 };
 
-const MAX_DATA_POINTS = 500;
+const MAX_DATA_POINTS = 2000; // Increased to support longer simulations (up to 2000 steps)
 
 // Data storage for incremental updates
 let chartData = {
@@ -103,6 +109,12 @@ let chartData = {
     hedgeErrorBS: [],
     hedgeErrorTFBS: [],
     hedgeErrorHESTON: [],
+    rewardBS: [],
+    rewardTFBS: [],
+    rewardHESTON: [],
+    strategyQualityBS: [],
+    strategyQualityTFBS: [],
+    strategyQualityHESTON: [],
 };
 
 // Trades storage - keep last N trades
@@ -485,6 +497,134 @@ function initCharts() {
         }
     });
     
+    // Reward chart - per model (much more informative!)
+    const rewardCtx = document.getElementById('rewardChart');
+    if (!rewardCtx) {
+        console.error('rewardChart element not found!');
+        return;
+    }
+    
+    charts.reward = new Chart(rewardCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'BS Reward',
+                    data: [],
+                    borderColor: '#3b82f6',
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    borderWidth: 1.5,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                },
+                {
+                    label: 'TFBS Reward',
+                    data: [],
+                    borderColor: '#f59e0b',
+                    backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                    borderWidth: 1.5,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                },
+                {
+                    label: 'HESTON Reward',
+                    data: [],
+                    borderColor: '#10b981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.08)',
+                    borderWidth: 1.5,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                }
+            ]
+        },
+        options: {
+            ...chartOptions,
+            scales: {
+                ...chartOptions.scales,
+                y: {
+                    ...chartOptions.scales.y,
+                    ticks: {
+                        ...chartOptions.scales.y.ticks,
+                        callback: function(value) {
+                            return value.toFixed(4);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
+    // Strategy Quality chart
+    const strategyQualityCtx = document.getElementById('strategyQualityChart');
+    if (!strategyQualityCtx) {
+        console.error('strategyQualityChart element not found!');
+        return;
+    }
+    
+    charts.strategyQuality = new Chart(strategyQualityCtx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'BS Quality',
+                    data: [],
+                    borderColor: '#3b82f6',
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    borderWidth: 1.5,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                },
+                {
+                    label: 'TFBS Quality',
+                    data: [],
+                    borderColor: '#f59e0b',
+                    backgroundColor: 'rgba(245, 158, 11, 0.08)',
+                    borderWidth: 1.5,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                },
+                {
+                    label: 'HESTON Quality',
+                    data: [],
+                    borderColor: '#10b981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.08)',
+                    borderWidth: 1.5,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                }
+            ]
+        },
+        options: {
+            ...chartOptions,
+            scales: {
+                ...chartOptions.scales,
+                y: {
+                    ...chartOptions.scales.y,
+                    ticks: {
+                        ...chartOptions.scales.y.ticks,
+                        callback: function(value) {
+                            return value.toFixed(4);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
     // All charts initialized silently
     
     // Add scroll synchronization for touchpad gestures
@@ -615,6 +755,26 @@ function _updateChartsFast() {
             charts.hedgeError.options.scales.x.max = Math.max(hedgeErrorLen - 1, 0);
         }
         
+        // Reward chart - per model
+        if (chartData.rewardBS.length > 0) {
+            const rewardLen = chartData.rewardBS.length;
+            charts.reward.data.labels = Array.from({length: rewardLen}, (_, i) => i);
+            charts.reward.data.datasets[0].data = chartData.rewardBS;
+            charts.reward.data.datasets[1].data = chartData.rewardTFBS;
+            charts.reward.data.datasets[2].data = chartData.rewardHESTON;
+            charts.reward.options.scales.x.max = Math.max(rewardLen - 1, 0);
+        }
+        
+        // Strategy Quality chart
+        if (chartData.strategyQualityBS.length > 0) {
+            const qualityLen = chartData.strategyQualityBS.length;
+            charts.strategyQuality.data.labels = Array.from({length: qualityLen}, (_, i) => i);
+            charts.strategyQuality.data.datasets[0].data = chartData.strategyQualityBS;
+            charts.strategyQuality.data.datasets[1].data = chartData.strategyQualityTFBS;
+            charts.strategyQuality.data.datasets[2].data = chartData.strategyQualityHESTON;
+            charts.strategyQuality.options.scales.x.max = Math.max(qualityLen - 1, 0);
+        }
+        
         // Update all charts in one batch
         // Note: Chart.js should automatically apply scale changes
         charts.price.update('none');
@@ -623,6 +783,8 @@ function _updateChartsFast() {
         charts.volume.update('none');
         if (chartData.modelDistBS.length > 0) charts.modelDist.update('none');
         if (chartData.hedgeErrorBS.length > 0) charts.hedgeError.update('none');
+        if (chartData.rewardBS.length > 0) charts.reward.update('none');
+        if (chartData.strategyQualityBS.length > 0) charts.strategyQuality.update('none');
         
     } catch (error) {
         console.error('Error updating charts:', error);
@@ -681,6 +843,28 @@ function updateCharts(data) {
             chartData.hedgeErrorBS.shift();
             chartData.hedgeErrorTFBS.shift();
             chartData.hedgeErrorHESTON.shift();
+        }
+    }
+    
+    if (ts.reward_BS !== undefined) {
+        chartData.rewardBS.push(ts.reward_BS || 0);
+        chartData.rewardTFBS.push(ts.reward_TFBS || 0);
+        chartData.rewardHESTON.push(ts.reward_HESTON || 0);
+        if (chartData.rewardBS.length > MAX_DATA_POINTS) {
+            chartData.rewardBS.shift();
+            chartData.rewardTFBS.shift();
+            chartData.rewardHESTON.shift();
+        }
+    }
+    
+    if (ts.strategy_quality_BS !== undefined) {
+        chartData.strategyQualityBS.push(ts.strategy_quality_BS || 0);
+        chartData.strategyQualityTFBS.push(ts.strategy_quality_TFBS || 0);
+        chartData.strategyQualityHESTON.push(ts.strategy_quality_HESTON || 0);
+        if (chartData.strategyQualityBS.length > MAX_DATA_POINTS) {
+            chartData.strategyQualityBS.shift();
+            chartData.strategyQualityTFBS.shift();
+            chartData.strategyQualityHESTON.shift();
         }
     }
     
@@ -950,6 +1134,12 @@ function startSimulation(event) {
         hedgeErrorBS: [],
         hedgeErrorTFBS: [],
         hedgeErrorHESTON: [],
+        rewardBS: [],
+        rewardTFBS: [],
+        rewardHESTON: [],
+        strategyQualityBS: [],
+        strategyQualityTFBS: [],
+        strategyQualityHESTON: [],
     };
     spotTrades = [];
     optionsTrades = [];
@@ -979,6 +1169,8 @@ function startSimulation(event) {
     resetChartAxis(charts.volume);
     resetChartAxis(charts.modelDist);
     resetChartAxis(charts.hedgeError);
+    if (charts.reward) resetChartAxis(charts.reward);
+    if (charts.strategyQuality) resetChartAxis(charts.strategyQuality);
     
     // Disable button to prevent double-click
     const startBtn = event?.target || document.querySelector('button.btn-primary');

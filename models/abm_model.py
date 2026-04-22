@@ -11,6 +11,10 @@ from options.market import OptionsMarket, OptionContract
 from options.pricing import PricingModel
 from agents.base_agents import Fundamentalist, Chartist, MarketMaker, NoiseTrader, pareto_int
 from agents.option_dealers import OptionDealer, OptionTaker
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from utils.detailed_logger import DetailedSimulationLogger
 
 
 class UnifiedABMModel(Model):
@@ -80,6 +84,9 @@ class UnifiedABMModel(Model):
         debug_print_every=0,
         debug_snapshot_every=0,
         debug_l2_depth=10,
+        # Detailed logging
+        enable_detailed_logging=True,
+        log_dir="simulation_logs",
         **cfg
     ):
         super().__init__()
@@ -174,7 +181,20 @@ class UnifiedABMModel(Model):
         self.debug_snapshot_every = int(debug_snapshot_every)
         self.debug_l2_depth = int(debug_l2_depth)
         
+        # Detailed logging for analysis
+        self.enable_detailed_logging = bool(cfg.get('enable_detailed_logging', enable_detailed_logging))
+        self.log_dir = str(cfg.get('log_dir', log_dir))
+        self.detailed_logger = DetailedSimulationLogger(
+            log_dir=self.log_dir,
+            enable=self.enable_detailed_logging
+        )
+        
         self._initialize_logging()
+        
+        # Initialize detailed logger after agents are created
+        if self.enable_detailed_logging:
+            n_dealers = len([a for a in self.agents_list if isinstance(a, OptionDealer)])
+            self.detailed_logger.initialize(n_dealers=n_dealers)
     
     def _initialize_options_market(self, n_contracts, option_tick_size, S0):
         """Initialize options market with contracts."""
@@ -302,7 +322,7 @@ class UnifiedABMModel(Model):
                     # Add small random variation to alpha
                     alpha = 0.85 + self.rng.uniform(-0.05, 0.05)
                     alpha = max(0.7, min(1.0, alpha))  # Keep in valid range
-                    pricer_kwargs = {"alpha": alpha, "n_mc": 5000}
+                    pricer_kwargs = {"alpha": alpha, "n_mc": 1000}
                 elif model_type == PricingModel.HESTON:
                     # Add small random variation to Heston parameters
                     kappa = 2.0 + self.rng.uniform(-0.3, 0.3)
@@ -314,7 +334,7 @@ class UnifiedABMModel(Model):
                         "theta": max(0.01, theta),
                         "sigma_v": max(0.1, sigma_v),
                         "rho": max(-0.9, min(-0.3, rho)),
-                        "n_mc": 5000
+                        "n_mc": 1000
                     }
                 
                 dealer = OptionDealer(
@@ -375,6 +395,9 @@ class UnifiedABMModel(Model):
             # Log hedging errors for all models
             self.dealer_hedge_errors_log = defaultdict(list)  # model -> list of (step, avg_error)
             self.dealer_hedge_errors_by_model = defaultdict(list)  # model -> list of errors over time
+            # Log reward and strategy quality
+            self.dealer_reward_log = []  # Average reward per model per step: {PricingModel: avg_reward}
+            self.dealer_strategy_quality_log = []  # Average strategy quality per model per step
     
     def update_regime(self):
         """Update market regime (calm/stress) based on indicators."""
@@ -519,6 +542,10 @@ class UnifiedABMModel(Model):
         # Logging
         self._log_step()
         
+        # Detailed logging
+        if self.enable_detailed_logging:
+            self.detailed_logger.log_step(self, self.market.book.t)
+        
         # Update Hawkes intensity
         self.hawkes_H = np.exp(-self.hawkes_beta * self.dt) * self.hawkes_H + float(n_events)
     
@@ -578,23 +605,74 @@ class UnifiedABMModel(Model):
             # Log average hedging errors for each model across all dealers
             # This helps understand why switching happens
             model_errors_sum = {PricingModel.BS: [], PricingModel.TFBS: [], PricingModel.HESTON: []}
+            dealers_with_errors = {PricingModel.BS: 0, PricingModel.TFBS: 0, PricingModel.HESTON: 0}
+            
             for dealer in dealers:
                 if hasattr(dealer, 'model_hedge_errors'):
                     for model_type in [PricingModel.BS, PricingModel.TFBS, PricingModel.HESTON]:
                         errors = dealer.model_hedge_errors.get(model_type, [])
                         if errors:
                             # Get recent errors (last switching_window)
-                            recent_errors = [e[1] for e in errors[-dealer.switching_window:]]
+                            recent_errors = [e[1] for e in errors[-dealer.switching_window:] if e[1] > 1e-10]  # Filter out zero errors
                             if recent_errors:
                                 model_errors_sum[model_type].extend(recent_errors)
+                                dealers_with_errors[model_type] += 1
             
             # Calculate average error per model
+            # Only average over dealers that actually have errors (to avoid diluting with zeros)
             for model_type in [PricingModel.BS, PricingModel.TFBS, PricingModel.HESTON]:
                 if model_errors_sum[model_type]:
                     avg_error = np.mean(model_errors_sum[model_type])
                     self.dealer_hedge_errors_by_model[model_type].append(avg_error)
                 else:
-                    self.dealer_hedge_errors_by_model[model_type].append(0.0)
+                    # If no errors, use NaN to indicate missing data (instead of 0.0 which is misleading)
+                    # But for compatibility with frontend, use 0.0 if no dealers have positions
+                    # Check if any dealer has inventory
+                    any_inventory = any(
+                        sum(abs(inv_data.get("position", 0)) for inv_data in dealer.inventory.values()) > 0.01
+                        for dealer in dealers
+                    )
+                    if any_inventory:
+                        # There's inventory but no errors - this is suspicious, use small value
+                        self.dealer_hedge_errors_by_model[model_type].append(0.0)
+                    else:
+                        # No inventory at all - legitimately no errors
+                        self.dealer_hedge_errors_by_model[model_type].append(0.0)
+            
+            # Log average reward per model (much more informative!)
+            # This shows which model gives better rewards
+            reward_by_model = {PricingModel.BS: [], PricingModel.TFBS: [], PricingModel.HESTON: []}
+            for dealer in dealers:
+                if hasattr(dealer, 'current_reward') and hasattr(dealer, 'current_strategy'):
+                    # Use current_strategy (the one actually used this step) not pricing_model
+                    strategy = dealer.current_strategy if hasattr(dealer, 'current_strategy') else dealer.pricing_model
+                    reward_by_model[strategy].append(dealer.current_reward)
+            
+            avg_reward_by_model = {}
+            for model_type in [PricingModel.BS, PricingModel.TFBS, PricingModel.HESTON]:
+                if reward_by_model[model_type]:
+                    avg_reward_by_model[model_type] = np.mean(reward_by_model[model_type])
+                else:
+                    avg_reward_by_model[model_type] = 0.0
+            
+            # Store as dict per model (like we do for quality)
+            self.dealer_reward_log.append(avg_reward_by_model)
+            
+            # Log average strategy quality per model
+            quality_by_model = {PricingModel.BS: [], PricingModel.TFBS: [], PricingModel.HESTON: []}
+            for dealer in dealers:
+                if hasattr(dealer, 'strategy_quality'):
+                    for model_type in [PricingModel.BS, PricingModel.TFBS, PricingModel.HESTON]:
+                        quality = dealer.strategy_quality.get(model_type, 0.0)
+                        quality_by_model[model_type].append(quality)
+            
+            avg_quality = {}
+            for model_type in [PricingModel.BS, PricingModel.TFBS, PricingModel.HESTON]:
+                if quality_by_model[model_type]:
+                    avg_quality[model_type] = np.mean(quality_by_model[model_type])
+                else:
+                    avg_quality[model_type] = 0.0
+            self.dealer_strategy_quality_log.append(avg_quality)
         
         if self.debug_print_every > 0 and (self.market.book.t % self.debug_print_every == 0):
             print(
@@ -612,7 +690,17 @@ class UnifiedABMModel(Model):
     
     def run(self):
         """Run the simulation."""
-        for _ in range(self.steps_n):
+        for i in range(self.steps_n):
             self.step()
+            # Progress indicator for long simulations
+            if (i + 1) % 100 == 0:
+                print(f"Step {i + 1}/{self.steps_n} completed...", end='\r')
+        
+        print()  # New line after progress
+        # Close detailed logger if enabled
+        if self.enable_detailed_logging:
+            self.detailed_logger.close()
+        
+        print("Simulation completed!")
         return np.array(self.market.prices, dtype=float)
 
