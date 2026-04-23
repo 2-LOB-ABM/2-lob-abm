@@ -675,7 +675,7 @@ from models.abm_model import UnifiedABMModel
 cfg = {
     "S0": 100.0,                    # Initial price
     "dt": 0.001,                    # Time step
-    "steps": 1000,                  # Number of simulation steps
+    "steps": 8000,                  # Number of simulation steps
     "n_fund": 10,                   # Number of fundamentalists
     "n_chart": 10,                  # Number of chartists
     "n_mm": 3,                      # Number of market makers
@@ -729,7 +729,7 @@ from experiments.hypotheses import run_h1_experiment, run_h2_experiment
 cfg = {
     "S0": 100.0,
     "dt": 0.001,
-    "steps": 2000,
+    "steps": 8000,
     "enable_options": True,
     "n_option_dealers": 15,
     "enable_model_switching": True,
@@ -912,8 +912,12 @@ The dashboard provides:
 **Measures**:
 - Stress episode frequency
 - Stress episode duration
-- Volatility clustering (autocorrelation)
-- Regime transition probabilities
+- Volatility clustering via autocorrelation of `|r|` and rolling `RV = sum(r_t^2)` on multiple lags
+- Regime transition probabilities (`P(calm→stress)`, `P(stress→calm)`)
+
+**Interpretation of autocorrelation metrics**:
+- If endogenous regime mechanism is active, ACF of `|r|` and `RV` stays positive across several lags (volatility persistence/clustering).
+- If the mechanism is weak or absent, volatility behaves closer to step-to-step noise and ACF rapidly decays to ~0.
 
 **Expected Results**:
 - Heterogeneous models → more frequent stress episodes

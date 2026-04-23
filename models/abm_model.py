@@ -419,14 +419,17 @@ class UnifiedABMModel(Model):
         
         if self.regime == 0:
             # calm -> stress
-            # Reduce sensitivity to shock_trigger to make transitions less frequent
-            p = min(1.0, self.p01 * (1.0 + shock_trigger * 0.5))  # Reduced multiplier from 1.0 to 0.5
+            # Keep calm regime more persistent.
+            p = min(1.0, self.p01 * (1.0 + shock_trigger * 0.35))
             if float(self.rng.uniform()) < p:
                 self.regime = 1
         else:
             # stress -> calm
-            # Make recovery slower - reduce probability when stress indicators are still high
-            recovery_factor = 1.0 - min(0.5, shock_trigger * 0.3)  # Slower recovery if stress indicators persist
+            # Slow recovery when stress indicators remain elevated.
+            recovery_factor = 1.0 - min(0.5, shock_trigger * 0.3)
+            # During active metaorder shocks, keep stress regime longer.
+            if self.meta_left > 0:
+                recovery_factor *= 0.4
             p = self.p10 * recovery_factor
             if float(self.rng.uniform()) < p:
                 self.regime = 0
@@ -437,10 +440,10 @@ class UnifiedABMModel(Model):
             if float(self.rng.uniform()) >= self.shock_rate:
                 return
             
-            # Make shocks longer-lasting but less frequent
-            # In calm: shorter shocks (40-80 steps), in stress: longer shocks (80-200 steps)
-            base_duration = int(self.rng.integers(40, 80))  # Increased from 20-120
-            self.meta_left = base_duration * (2 if self.regime == 1 else 1)
+            # Use longer metaorders so agents have time to adapt and settle.
+            # In calm: 120-220 steps, in stress: 360-660 steps.
+            base_duration = int(self.rng.integers(120, 220))
+            self.meta_left = base_duration * (3 if self.regime == 1 else 1)
             self.meta_side = "sell" if float(self.rng.uniform()) < 0.6 else "buy"
             # Moderate intensity - not too extreme
             self.meta_intensity = int(self.rng.integers(5, 12)) * (2 if self.regime == 1 else 1)  # Reduced multiplier

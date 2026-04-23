@@ -37,14 +37,26 @@ class LOBMarket:
     def cancel(self, order_id):
         return self.book.cancel(order_id)
 
+    @staticmethod
+    def _safe_positive_price(value, fallback=1e-8):
+        """Return a finite strictly-positive price."""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+        if not np.isfinite(v) or v <= 0.0:
+            return float(fallback)
+        return v
+
     def end_step(self):
         if self.book.last_trade_price is not None:
-            new_price = float(self.book.last_trade_price)
+            raw_new_price = self.book.last_trade_price
         else:
-            new_price = float(self.book.mid_price(self.mid))
+            raw_new_price = self.book.mid_price(self.mid)
 
-        new_price = float(max(new_price, 1e-8))
-        r = float(np.log(new_price / self.mid))
+        prev_mid = self._safe_positive_price(self.mid, fallback=1e-8)
+        new_price = self._safe_positive_price(raw_new_price, fallback=prev_mid)
+        r = float(np.log(new_price / prev_mid))
 
         self.mid = new_price
         self.prices.append(self.mid)
@@ -75,7 +87,8 @@ class LOBMarket:
     
     def mark_to_market(self):
         if self.book.last_trade_price is not None:
-            self.mid = float(self.book.last_trade_price)
+            raw_mid = self.book.last_trade_price
         else:
-            self.mid = float(self.book.mid_price(self.mid))
+            raw_mid = self.book.mid_price(self.mid)
+        self.mid = self._safe_positive_price(raw_mid, fallback=self._safe_positive_price(self.mid, fallback=1e-8))
 

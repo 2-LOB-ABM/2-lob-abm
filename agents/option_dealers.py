@@ -625,8 +625,19 @@ class OptionDealer(Agent):
             return self.current_strategy
         
         # Select strategy based on weights (categorical distribution)
+        # Guard against NaN/Inf or degenerate probabilities.
         weights_list = [self.strategy_weights[m] for m in self.available_models]
-        selected_idx = self.model.rng.choice(len(self.available_models), p=weights_list)
+        weights = np.asarray(weights_list, dtype=float)
+        invalid = (~np.isfinite(weights)) | (weights < 0)
+        if np.any(invalid):
+            weights[invalid] = self.epsilon_floor
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-12:
+            weights = np.full(len(self.available_models), 1.0 / len(self.available_models), dtype=float)
+        else:
+            weights = weights / weight_sum
+
+        selected_idx = self.model.rng.choice(len(self.available_models), p=weights)
         selected_strategy = self.available_models[selected_idx]
         
         # Update switch step if strategy changed
@@ -792,37 +803,40 @@ class OptionDealer(Agent):
         if not self.enable_model_switching:
             return
         
-        # Calculate new unnormalized weights
-        new_weights = {}
-        denominator = 0.0
-        
+        # Numerically stable replicator update in log-space:
+        # log(w'_s) = log(w_s) + eta * Q_s, then softmax.
+        log_scores = []
         for strategy in self.available_models:
-            # Apply epsilon-floor
-            current_weight = max(self.strategy_weights[strategy], self.epsilon_floor)
-            quality = self.strategy_quality[strategy]
-            
-            # Replicator update
-            new_weight = current_weight * np.exp(self.eta * quality)
-            new_weights[strategy] = new_weight
-            denominator += new_weight
-        
-        # Normalize weights (ensure they sum to 1)
-        if denominator > 1e-10:
-            for strategy in self.available_models:
-                self.strategy_weights[strategy] = new_weights[strategy] / denominator
-                # Apply epsilon-floor again after normalization
-                self.strategy_weights[strategy] = max(self.strategy_weights[strategy], self.epsilon_floor)
+            current_weight = float(max(self.strategy_weights[strategy], self.epsilon_floor))
+            quality = float(self.strategy_quality[strategy])
+            if not np.isfinite(quality):
+                quality = 0.0
+            log_scores.append(np.log(current_weight) + self.eta * quality)
+
+        log_scores = np.asarray(log_scores, dtype=float)
+        finite_mask = np.isfinite(log_scores)
+        if not np.any(finite_mask):
+            probs = np.full(len(self.available_models), 1.0 / len(self.available_models), dtype=float)
         else:
-            # Fallback: equal weights if denominator is too small
-            equal_weight = 1.0 / len(self.available_models)
-            for strategy in self.available_models:
-                self.strategy_weights[strategy] = equal_weight
-        
-        # Renormalize after applying floor
-        total_weight = sum(self.strategy_weights.values())
-        if total_weight > 1e-10:
-            for strategy in self.available_models:
-                self.strategy_weights[strategy] /= total_weight
+            max_log = np.max(log_scores[finite_mask])
+            exp_scores = np.exp(np.clip(log_scores - max_log, -700.0, 100.0))
+            exp_scores[~np.isfinite(exp_scores)] = 0.0
+            total = float(np.sum(exp_scores))
+            if total <= 1e-12:
+                probs = np.full(len(self.available_models), 1.0 / len(self.available_models), dtype=float)
+            else:
+                probs = exp_scores / total
+
+        # Apply floor and renormalize to preserve valid probability simplex.
+        probs = np.maximum(probs, self.epsilon_floor)
+        probs_sum = float(np.sum(probs))
+        if probs_sum <= 1e-12:
+            probs = np.full(len(self.available_models), 1.0 / len(self.available_models), dtype=float)
+        else:
+            probs = probs / probs_sum
+
+        for i, strategy in enumerate(self.available_models):
+            self.strategy_weights[strategy] = float(probs[i])
     
     def _apply_strategy(self, strategy):
         """

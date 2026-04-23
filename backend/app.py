@@ -7,6 +7,12 @@ import threading
 import sys
 import os
 import numpy as np
+import pandas as pd
+from pathlib import Path
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # Add parent directory to path to import models
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -15,6 +21,13 @@ from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
 from models.abm_model import UnifiedABMModel
 from options.pricing import PricingModel
+from run_simulation import plot_results
+from analyze_results import (
+    analyze_regime_model_relationship,
+    analyze_switching_patterns,
+    analyze_performance_metrics,
+)
+from utils.analyze_logs import analyze_simulation_logs, save_analysis_report
 
 app = Flask(__name__, 
             template_folder='templates',
@@ -31,6 +44,147 @@ simulation_state = {
     'config': None,
     'step_delay': 0.1  # No delay between steps - maximum speed
 }
+
+PLOTS_DIR = Path("plots")
+PLOTS_DIR.mkdir(exist_ok=True)
+
+
+def save_simulation_artifacts(model, step_count):
+    """
+    Save simulation logs and PNG plot after browser-run simulation.
+    Returns a dict with artifact locations and status message.
+    """
+    artifacts = {
+        'log_dir': str(getattr(model, 'log_dir', 'simulation_logs'))
+    }
+    logger = getattr(model, 'detailed_logger', None)
+    if logger:
+        artifacts['market_log_path'] = str(getattr(logger, 'market_filepath', ''))
+        artifacts['dealers_log_path'] = str(getattr(logger, 'dealer_filepath', ''))
+
+    # Ensure detailed logs are flushed to disk.
+    if hasattr(model, 'detailed_logger') and model.detailed_logger:
+        try:
+            model.detailed_logger.close()
+        except Exception as e:
+            print(f"Error closing logger: {e}")
+
+    try:
+        market_log = artifacts.get('market_log_path')
+        dealers_log = artifacts.get('dealers_log_path')
+        if market_log and dealers_log and os.path.exists(market_log) and os.path.exists(dealers_log):
+            hypothesis_artifacts = run_hypothesis_checks(
+                market_log_path=market_log,
+                dealers_log_path=dealers_log,
+                output_dir=artifacts['log_dir'],
+            )
+            artifacts.update(hypothesis_artifacts)
+    except Exception as e:
+        print(f"Error running hypothesis checks: {e}")
+
+    try:
+        prices = np.array(model.market.prices, dtype=float)
+        if prices.size > 1:
+            fig = plot_results(model, prices)
+            timestamp = int(time.time())
+            plot_path = PLOTS_DIR / f"dashboard_simulation_{timestamp}.png"
+            fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            artifacts['plot_path'] = str(plot_path)
+    except Exception as e:
+        print(f"Error saving PNG plot: {e}")
+
+    message = f"Simulation completed: {step_count} steps executed, t={model.market.book.t}"
+    if 'plot_path' in artifacts:
+        message += f"\nPNG: {artifacts['plot_path']}"
+    message += f"\nLogs: {artifacts['log_dir']}"
+    if 'hypothesis_json_path' in artifacts:
+        message += f"\nHypothesis JSON: {artifacts['hypothesis_json_path']}"
+    if 'analysis_report_path' in artifacts:
+        message += f"\nAnalysis TXT: {artifacts['analysis_report_path']}"
+    artifacts['message'] = message
+    return artifacts
+
+
+def _to_native(obj):
+    """Convert numpy/pandas types to JSON-serializable Python types."""
+    if isinstance(obj, dict):
+        return {str(k): _to_native(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_native(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_to_native(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    return obj
+
+
+def run_hypothesis_checks(market_log_path, dealers_log_path, output_dir):
+    """
+    Run hypothesis checks on saved CSV logs and persist reports.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    market_df = pd.read_csv(market_log_path)
+    dealer_df = pd.read_csv(dealers_log_path)
+
+    regime_model = analyze_regime_model_relationship(market_df)
+    switching = analyze_switching_patterns(dealer_df)
+    performance = analyze_performance_metrics(market_df, dealer_df)
+
+    stress_pct = float((market_df["regime"] == 1).mean() * 100.0) if len(market_df) > 0 else 0.0
+    heston_diff = float(regime_model.get("HESTON", {}).get("diff", 0.0))
+    heston_p = float(regime_model.get("HESTON", {}).get("perm_pval", float("nan")))
+
+    hypothesis_summary = {
+        "input_logs": {
+            "market": str(market_log_path),
+            "dealers": str(dealers_log_path),
+        },
+        "overview": {
+            "n_steps": int(len(market_df)),
+            "n_dealers": int(dealer_df["dealer_id"].nunique()) if "dealer_id" in dealer_df.columns else 0,
+            "stress_pct": stress_pct,
+        },
+        "hypotheses": {
+            "H1_regime_model_relationship": {
+                "heston_stress_minus_calm": heston_diff,
+                "heston_perm_pvalue": heston_p,
+                "significant_at_5pct": bool(np.isfinite(heston_p) and heston_p < 0.05),
+            },
+            "H1_switching_performance_driven": {
+                "n_switches": int(switching.get("n_switches", 0)),
+                "chose_min_error_rate": float(switching.get("chose_min_error", {}).get("rate", float("nan"))),
+                "chose_min_error_pvalue": float(switching.get("chose_min_error", {}).get("pval", float("nan"))),
+                "significant_at_5pct": bool(
+                    np.isfinite(switching.get("chose_min_error", {}).get("pval", float("nan")))
+                    and float(switching.get("chose_min_error", {}).get("pval", 1.0)) < 0.05
+                ),
+            },
+        },
+        "regime_model_details": regime_model,
+        "switching_details": switching,
+        "performance_metrics": performance,
+    }
+
+    timestamp = int(time.time())
+    hypothesis_json_path = output_path / f"hypothesis_report_{timestamp}.json"
+    with open(hypothesis_json_path, "w", encoding="utf-8") as f:
+        json.dump(_to_native(hypothesis_summary), f, ensure_ascii=False, indent=2)
+
+    full_analysis = analyze_simulation_logs(
+        market_file=market_log_path,
+        dealer_file=dealers_log_path,
+        log_dir=str(output_path),
+    )
+    analysis_report_path = output_path / f"simulation_analysis_report_{timestamp}.txt"
+    save_analysis_report(full_analysis, output_file=str(analysis_report_path))
+
+    return {
+        "hypothesis_json_path": str(hypothesis_json_path),
+        "analysis_report_path": str(analysis_report_path),
+    }
 
 def get_step_data(model):
     """Extract all relevant data from a simulation step."""
@@ -344,17 +498,12 @@ def run_simulation():
             if model.market.book.t >= model.steps_n:
                 print(f"Simulation complete: t={model.market.book.t}, steps_n={model.steps_n}, step_count={step_count}")
                 simulation_state['running'] = False
+                artifacts = save_simulation_artifacts(model, step_count)
                 try:
                     socketio.emit('simulation_step', step_data)
-                    socketio.emit('simulation_complete', {'message': f'Simulation completed: {step_count} steps executed, t={model.market.book.t}'})
+                    socketio.emit('simulation_complete', artifacts)
                 except:
                     pass
-                # Close detailed logger to ensure all data is written to disk
-                if hasattr(model, 'detailed_logger') and model.detailed_logger:
-                    try:
-                        model.detailed_logger.close()
-                    except Exception as e:
-                        print(f"Error closing logger: {e}")
                 break
             
             
@@ -429,7 +578,7 @@ def handle_start_simulation(config):
         default_config = {
             "S0": 100.0,
             "dt": 0.001,
-            "steps": 500,  # Reduced for faster testing
+            "steps": 10000,  # Longer horizon to let dynamics settle
             "n_fund": 10,
             "n_chart": 10,
             "n_mm": 3,
@@ -446,9 +595,11 @@ def handle_start_simulation(config):
                 "TFBS": 0.25,
                 "HESTON": 0.25
             },
-            "p01": 0.005,
-            "p10": 0.03,
-            "shock_rate": 0.003,
+            "p01": 0.0025,
+            "p10": 0.015,
+            "shock_rate": 0.002,
+            "enable_detailed_logging": True,
+            "log_dir": "simulation_logs",
         }
         
         # Merge with provided config

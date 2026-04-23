@@ -23,7 +23,7 @@ def get_config():
     return {
         "S0": 100.0,
         "dt": 0.001,
-        "steps": 2000,
+        "steps": 5000,
         "n_fund": 15,
         "n_chart": 15,
         "n_mm": 5,
@@ -43,9 +43,9 @@ def get_config():
             PricingModel.TFBS: 0.33,
             PricingModel.HESTON: 0.34
         },
-        "p01": 0.005,
-        "p10": 0.03,
-        "shock_rate": 0.003,
+        "p01": 0.0025,
+        "p10": 0.015,
+        "shock_rate": 0.002,
         "shock_impact": 8.0,
         "enable_detailed_logging": True,
         "log_dir": "simulation_logs",

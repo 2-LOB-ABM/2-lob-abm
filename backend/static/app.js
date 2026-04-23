@@ -95,7 +95,7 @@ let dataBuffers = {
     optionDepths: {},
 };
 
-const MAX_DATA_POINTS = 2000; // Increased to support longer simulations (up to 2000 steps)
+const MAX_DATA_POINTS = 6000; // Keep more points for longer default runs
 
 // Data storage for incremental updates
 let chartData = {
@@ -1074,10 +1074,13 @@ socket.on('simulation_paused', (data) => {
     updateStatus(data.status === 'paused' ? 'paused' : 'running', data.status !== 'paused');
 });
 
-socket.on('simulation_complete', () => {
+socket.on('simulation_complete', (data) => {
     updateStatus('completed', false);
     const startBtn = document.getElementById('startBtn');
     if (startBtn) startBtn.disabled = false;
+    if (data && data.message) {
+        alert(data.message);
+    }
 });
 
 socket.on('error', (data) => {
@@ -1184,7 +1187,6 @@ function startSimulation(event) {
     const config = {
         S0: 100.0,
         dt: 0.001,
-        steps: 1000,
         n_fund: 10,
         n_chart: 10,
         n_mm: 3,
@@ -1201,9 +1203,6 @@ function startSimulation(event) {
             TFBS: 0.33,
             HESTON: 0.34
         },
-        p01: 0.005,
-        p10: 0.03,
-        shock_rate: 0.003,
     };
     
     socket.emit('start_simulation', config);

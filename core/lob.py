@@ -187,7 +187,8 @@ class LimitOrderBook:
             return None
                 
         self.n_limit_in_step += 1
-        price_ticks = int(round(float(price) / self.tick_size))
+        # Prevent non-positive price levels in the book.
+        price_ticks = max(1, int(round(float(price) / self.tick_size)))
         oid = next(self._oid)
         o = Order(oid=oid, agent_id=int(agent_id), side=side, qty=qty, price_ticks=price_ticks, t=self.t, ttl=int(ttl))
         if o.ttl > 0:

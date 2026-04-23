@@ -1,0 +1,87 @@
+================================================================================
+SIMULATION ANALYSIS REPORT
+================================================================================
+
+Market log: simulation_logs/market_log_1776943287.csv
+Dealer log: simulation_logs/dealers_log_1776943287.csv
+Steps: 10000
+Dealers: 5
+
+STATISTICS
+--------------------------------------------------------------------------------
+
+PRICE:
+  initial: 100.0
+  final: 0.7000000000000001
+  min: 0.1
+  max: 122.8
+  volatility: 0.49799044582737834
+  max_drop: -3.299999999999997
+  max_jump: 2.4000000000000057
+
+REGIME:
+  stress_periods: 4498
+  stress_percentage: 44.98
+  regime_switches: 55
+
+SPREAD:
+  avg: 0.49544396071681646
+  max: 1.8999999999999917
+  in_stress: 0.6893761301989149
+  in_calm: 0.3381074637814041
+
+REWARDS:
+  avg: -254.92032986684976
+  std: 1116.6592225323514
+  min: -9726.338330023063
+  max: 5348.652449131627
+  negative_percentage: 64.05
+  per_dealer: {74: {'mean': -493.02955237024884, 'std': 1754.0811180721366, 'min': -9726.338330023063, 'max': 5348.652449131627, 'sum': -4930295.523702488}, 75: {'mean': -343.6289341438688, 'std': 1084.792321911431, 'min': -3508.1297070875935, 'max': 2554.982723781195, 'sum': -3436289.341438688}, 76: {'mean': -353.18507397787, 'std': 1195.9832612567332, 'min': -5847.224343916928, 'max': 3327.420125012633, 'sum': -3531850.7397787}, 77: {'mean': -24.584432399021775, 'std': 362.1368148941426, 'min': -749.5821460547419, 'max': 1559.398319193647, 'sum': -245844.32399021776}, 78: {'mean': -60.17365644323921, 'std': 504.80227852014826, 'min': -1395.134002381776, 'max': 2241.0601301661063, 'sum': -601736.5644323921}}
+
+STRATEGY_QUALITY:
+  BS: -176.70882337441222
+  TFBS: -224.51786610735218
+  HESTON: -121.87911214855127
+
+HEDGE_ERRORS:
+  BS: 1036.2182726215801
+  TFBS: 993.1784217528761
+  HESTON: 1116.3900730755452
+
+SWITCHING:
+  total_switches: 16495
+  switch_rate_percent: 32.99
+
+STRATEGY_DISTRIBUTION:
+  final: {'TimeFractionalBS': 3, 'BlackScholes': 2}
+
+WEALTH:
+  avg_change: 16341.837657123158
+  per_dealer: {74: {'first': 0.0, 'last': 16804.643030353993, 'change': 16804.643030353993}, 75: {'first': 0.0, 'last': 12107.324684566804, 'change': 12107.324684566804}, 76: {'first': 0.0, 'last': 29644.144914413537, 'change': 29644.144914413537}, 77: {'first': 0.0, 'last': 24148.931497956208, 'change': 24148.931497956208}, 78: {'first': 0.0, 'last': -995.855841674756, 'change': -995.855841674756}}
+
+MODEL_DISTRIBUTION:
+  final_BS: 0.4
+  final_TFBS: 0.6
+  final_HESTON: 0.0
+
+
+ISSUES FOUND
+--------------------------------------------------------------------------------
+
+1. [MEDIUM] Rewards
+   Issue: Average reward is very negative: -254.920330
+   Description: Dealers are consistently losing money on average.
+
+2. [MEDIUM] Strategy Quality
+   Issue: Strategy quality is degrading over time
+   Description: Quality slopes: BS=-0.083024, TFBS=-0.090480, HESTON=-0.073966
+
+3. [MEDIUM] Hedging Errors
+   Issue: HESTON errors are not significantly lower than BS
+   Description: HESTON error (1116.390073) should be much lower than BS (1036.218273)
+
+
+RECOMMENDATIONS
+--------------------------------------------------------------------------------
+1. Check if off-policy learning is working correctly for unused strategies.
+2. Verify HESTON model implementation and hedging calculation.
